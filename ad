@@ -1,0 +1,256 @@
+#!/bin/sh
+
+export LC_ALL=en_US.UTF-8
+cachefile="/root/ad.cache"
+
+usage() {
+        echo "Usage: $0 <arg>"
+        echo "args:"
+        echo "    help"
+        echo "    update-cache"
+        echo "    show-hosts"
+        echo "    connect-to <computer name>"
+        echo "    package <-g group[s] | -h host[s]> <-i package | -r package | -d file>"
+}
+
+gethosts() {
+        awk '
+            /^objectClass: computer$/ {
+                while (getline > 0) {
+                    if (/^$/) {
+                        output = output "\n"
+                        next
+                    }
+
+                    if (/^cn: .+$/)
+                        output = output gensub(/^cn: (.+)$/, "Computer: \\1", "g") "\n"
+
+                    if (/^operatingSystem: .+$/)
+                        output = output gensub(/^operatingSystem: (.+)$/, "Operating System: \\1", "g") "\n"
+
+                }
+            }
+
+            END {
+                printf output
+            }'
+}
+
+getdomain() {
+        awk -v "NAME=$1" '
+            /^objectClass: computer$/ {
+                while (getline > 0) {
+                    if (/^$/)
+                        next
+     
+                    if (gensub(/^name: (.+)$/, "\\1", "g") == NAME) {
+                        while (getline > 0) {
+                            if (/^$/)
+                                exit 0
+     
+                            if (/^dNSHostName: .+$/) {
+                                printf gensub(/^dNSHostName: (.+)$/, "\\1", "g")
+                                exit 0
+                            }
+                        }
+                    }
+                }
+            }'
+}
+
+if [ $# -eq 0 ]; then
+        usage 1>&2
+        exit 1
+fi
+
+case "$1" in
+update-cache)
+        echo -n "Enter AD admin login: "
+        read login
+
+        echo -n "Enter AD admin password: "
+        stty -echo
+        read password
+        stty echo; echo
+
+        net -U "$login%$password" ads search '(objectClass=*)' >"$cachefile"
+        ;;
+
+show-hosts)
+        if [ ! -f "$cachefile" ]; then
+                echo Cache file not found 1>&2
+
+                exit 1
+        fi
+
+        echo "$(cat "$cachefile" | gethosts)"
+        ;;
+
+connect-to)
+        if [ $# -ne 2 ]; then
+                usage 1>&2
+                exit 1
+        fi
+
+        if [ ! -f "$cachefile" ]; then
+                echo Cache file not found 1>&2
+                exit 1
+        fi
+
+        domain="$(cat "$cachefile" | getdomain $2)"
+
+        ssh -i "/root/.ssh/$2" root@"$domain"
+        ;;
+
+package)
+        shift 1
+        unset act groups hosts package file
+
+        while getopts "g:h:i:r:d:" opt; do
+                case $opt in
+                g)
+                        groups="$OPTARG"
+                        ;;
+
+                h)
+                        hosts="$OPTARG"
+                        ;;
+
+                i)
+                        act="install"
+                        package="$OPTARG"
+                        ;;
+
+                r)
+                        act="remove"
+                        package="$OPTARG"
+                        ;;
+
+                d)
+                        act="dpkg_install"
+                        file="$OPTARG"
+                        ;;
+
+                *)
+                        usage 1>&2
+
+                        exit 1
+                        ;;
+                esac
+        done
+
+        if [ -z "$act" -o \
+             -z "$groups" -a -z "$hosts" -o \
+             -z "$package" -a -z "$file" ]; then
+                usage 1>&2
+
+                exit 1
+        fi
+
+        tmpdir="$(mktemp -d /tmp/ad.XXX)"
+        errfile="$(mktemp $tmpdir/err.XXX)"
+        checkfile="$(mktemp $tmpdir/check.XXX)"
+        h_count="$(mktemp $tmpdir/h_count.XXX)"
+
+        hosts="$hosts $(
+                echo "$groups" | tr ',' '\n' |
+                while read group; do
+                        cat "$cachefile" | awk -v "group=$group" '
+                            /^objectClass: computer$/ {
+                                while (getline > 0) {
+                                    if (/^$/)
+                                        next
+
+                                    regex = "^distinguishedName: .+,OU=" group ",.+$"
+
+                                    if ($0 ~ regex) {
+                                        printf "," gensub(/^distinguishedName: CN=([^,]+),.+$/, "\\1", "g")
+                                    }
+                                }
+                            }
+                        '
+
+                done
+        )"
+
+        i=0
+
+        echo "$hosts" | tr ',' '\n' |
+        while read host; do
+                domain="$(cat "$cachefile" | getdomain $host)"
+
+                if [ -z "$domain" ]; then
+                        # TODO
+                        echo "Host (""$host"") domain not found" >>"$errfile"
+                        continue
+                fi
+
+                if [ "$act" = "install" ]; then
+                        {
+                        echo "Installing $package to $host"
+
+                        ssh -i "/root/.ssh/$host" "root@$domain" \
+                            "apt -y install $package 2>&1" &>"/tmp/$host.log"
+
+                        if [ $? -ne 0 ]; then
+                                echo "E: host: $host, log: /tmp/$host.log" 1>"$errfile"
+                        fi
+
+                        echo >"$checkfile"
+                        } &
+
+                elif [ "$act" = "remove" ]; then
+                        {
+                        echo "Removing $package from $host"
+
+                        ssh -i "/root/.ssh/$host" "root@$domain" \
+                            "apt -y purge $package 2>&1" &>"/tmp/$host.log"
+
+                        if [ $? -ne 0 ]; then
+                                echo "E: host: $host, log: /tmp/$host.log" 1>"$errfile"
+                        fi
+
+                        echo >"$checkfile"
+                        } &
+
+                elif [ "$act" = "dpkg_install" ]; then
+                        {
+                        echo "Installing $file to $host"
+
+                        scp -i "/root/.ssh/$host" "$file" "root@$domain:/tmp/" \
+                            &>"/tmp/$host.log"
+
+                        ssh -i "/root/.ssh/$host" "root@$domain" \
+                            "dpkg -i /tmp/${file##*/};
+                             apt install -f -y;
+                             rm /tmp/${file##*/}" \
+                            &>"/tmp/$host.log"
+
+                        echo >"$checkfile"
+                        } &
+                fi
+
+                echo $(($i+1)) >"$h_count"
+        done
+
+        cat "$errfile" 1>&2
+
+        while [ "$(wc -l "$checkfile" | cut -d ' ' -f 1)" -ne "$(cat "$h_count")" ]; do
+                sleep 1
+        done
+
+        rm -rf "$tmpdir"
+        ;;
+
+help)
+        usage
+        ;;
+
+*)
+        usage 1>&2
+
+        exit 1
+        ;;
+esac
+
+exit 0
